@@ -5,6 +5,9 @@ from typing import Callable
 import safetensors
 import torch
 import torch.nn as nn
+import nltk
+import numpy as np
+from typing import Tuple
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
@@ -16,6 +19,7 @@ from zonos.config import InferenceParams, ZonosConfig
 from zonos.sampling import sample_from_logits
 from zonos.speaker_cloning import SpeakerEmbeddingLDA
 from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
+from zonos.codebook_pattern import interpolate_latents
 
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
 
@@ -54,6 +58,113 @@ class Zonos(nn.Module):
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+    
+
+    def generate_with_latent_windows(
+        self,
+        text: str,
+        cond_dict: dict,
+        overlap_seconds: float = 0.1,
+        cfg_scale: float = 2.0,
+        min_p: float = 0.15,
+        seed: int = 420,
+    ):
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
+        
+        # Set global seed
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        
+        # Split into sentences
+        sentences = nltk.sent_tokenize(text)
+        if len(sentences) == 1:
+            # Single sentence - generate normally
+            torch.manual_seed(seed)
+            conditioning = self.prepare_conditioning(cond_dict)
+            codes = self.generate(
+                prefix_conditioning=conditioning,
+                max_new_tokens=86 * 120,  # 120 seconds max
+                cfg_scale=cfg_scale,
+                batch_size=1,
+                sampling_params=dict(min_p=min_p)
+            )
+            wav_out = self.autoencoder.decode(codes).cpu().detach()
+            return self.autoencoder.sampling_rate, wav_out.squeeze().numpy()
+
+        # Calculate window sizes in latent tokens
+        tokens_per_second = 86
+        overlap_size = int(overlap_seconds * tokens_per_second)
+        
+        all_codes = []
+        
+        for i, sentence in enumerate(sentences):
+            # Create conditioning for this sentence
+            sent_dict = cond_dict.copy()
+            sent_dict['espeak'] = ([sentence], [cond_dict['espeak'][1][0]])
+            
+            # Generate this sentence
+            torch.manual_seed(seed)
+            conditioning = self.prepare_conditioning(sent_dict)
+            codes = self.generate(
+                prefix_conditioning=conditioning,
+                max_new_tokens=int(len(sentence) * 1.5 * tokens_per_second / 10),
+                cfg_scale=cfg_scale,
+                batch_size=1,
+                sampling_params=dict(min_p=min_p)
+            )
+            
+            if i == 0:
+                all_codes.append(codes)
+                continue
+                
+            # Find best overlap position based on content similarity
+            overlap_a = all_codes[-1][..., -overlap_size:]
+            overlap_b = codes[..., :overlap_size]
+            
+            # Calculate similarity scores across the overlap region
+            similarity = torch.cosine_similarity(
+                overlap_a.float(), 
+                overlap_b.float(),
+                dim=1
+            ).mean(dim=0)
+            
+            # Find the position with highest similarity for crossfade
+            best_pos = torch.argmax(similarity)
+            effective_overlap = overlap_size - best_pos
+            
+            # Apply cosine fade for smooth transition
+            fade = torch.cos(torch.linspace(math.pi, 0, effective_overlap, device=codes.device))
+            fade = 0.5 * (1 + fade)
+            fade = fade.view(1, 1, -1)
+            
+            # Crossfade at the best position
+            overlap_region = (
+                overlap_a[..., -effective_overlap:] * (1 - fade) + 
+                overlap_b[..., -effective_overlap:] * fade
+            )
+            
+            # Replace overlap region in previous sentence
+            all_codes[-1] = torch.cat([
+                all_codes[-1][..., :-effective_overlap],
+                overlap_region
+            ], dim=-1)
+            
+            # Add new sentence (excluding overlap)
+            all_codes.append(codes[..., effective_overlap:])
+            
+            # Check total length
+            total_length = sum(c.shape[-1] for c in all_codes)
+            if total_length >= tokens_per_second * 120:  # 120 seconds max
+                break
+        
+        # Concatenate all sentences
+        final_codes = torch.cat(all_codes, dim=-1)
+        final_codes = final_codes.to(torch.long)
+        
+        return final_codes
 
     def generate_chunked(
         self,
